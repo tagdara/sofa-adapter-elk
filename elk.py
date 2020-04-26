@@ -423,6 +423,8 @@ class elkm1(sofabase):
                 return 'NOT_DETECTED'
             elif self.nativeObject['status']=='Violated':
                 return 'DETECTED'
+            
+            return 'DETECTED'
 
     class MotionSensor(devices.MotionSensor):
 
@@ -433,6 +435,8 @@ class elkm1(sofabase):
                 return 'NOT_DETECTED'
             elif self.nativeObject['status']=='Violated':
                 return 'DETECTED'
+            
+            return 'NOT_DETECTED'
 
     class TemperatureSensor(devices.TemperatureSensor):
 
