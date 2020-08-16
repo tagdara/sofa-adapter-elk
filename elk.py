@@ -5,8 +5,7 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 
-from sofabase import sofabase
-from sofabase import adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
 
 import math
@@ -20,7 +19,8 @@ import time
 
 class Client(asyncio.Protocol):
 
-    def __init__(self, loop=None, log=None, notify=None, dataset=None, **kwargs):
+    def __init__(self, loop=None, log=None, notify=None, dataset=None, config=None, **kwargs):
+        self.config=config
         self.is_open = False
         self.loop = loop
         self.log=log
@@ -31,6 +31,8 @@ class Client(asyncio.Protocol):
         self.dataset=dataset
         self.lastcommand=""
         self.controllerMap=dict()
+        self.dataset.connected=False
+        self.initial_data=False
         
         # populate base dataset to eliminate oddly formatted adds
         self.dataset.nativeDevices={"zone": {}, "output": {}, "task": {}}
@@ -55,6 +57,7 @@ class Client(asyncio.Protocol):
             self.requestOutputs()
             self.requestTasks()
             self.checkSendQueue()
+            #self.dataset.connected=True
         except:
             self.log.error('Error sending request', exc_info=True)
         
@@ -82,6 +85,9 @@ class Client(asyncio.Protocol):
                 if self.programmingMode==False:
                     self.lastcommand=self.sendQueue.pop(0)
                 self.send(self.lastcommand)
+            elif self.initial_data==False:
+                self.initial_data=True
+                self.dataset.connected=True
 
         except:
             self.log.error('Error bumping elk queue',exc_info=True)
@@ -130,7 +136,7 @@ class Client(asyncio.Protocol):
             if not self.programmingMode:
                 self.log.info('Elk RP Programming mode is active.  Command deferred for retry: %s' % self.lastcommand)
                 self.programmingMode=True
-            time.sleep(1)
+            await asyncio.sleep(1)
             return False
             
         self.programmingMode=False
@@ -177,6 +183,9 @@ class Client(asyncio.Protocol):
         
         elif command=="Request Ethernet test":
             self.log.debug('Ethernet heartbeat')
+
+        elif command=="Log data with index":
+            await self.logDataWithIndex(data)
         
         elif command=="Control output change update": #CC
             try:
@@ -188,7 +197,7 @@ class Client(asyncio.Protocol):
             self.log.info('elk %s > %s' % (command, data.replace('\n', ' ').replace('\r', '')))
 
 
-    def requestLogData(self,count=5):
+    def requestLogData(self,count=25):
         
         for i in range (1,count+1):
             # get log data
@@ -308,7 +317,21 @@ class Client(asyncio.Protocol):
             self.log.error("temperatureReport Error",exc_info=True)
             return {}
 
-        
+    async def logDataWithIndex(self, data):
+
+        # ASCII String Text Descriptions stored in device
+        try:
+            data=self.clipElkData(data)
+            event=str(data[2:6])
+            event_number=str(data[6:9])
+            event_area=str(data[9])
+            event_time=str(data[10:12])+":"+str(data[12:14])
+            event_date=str(data[14:16])+"/"+str(data[16:18])
+            event_name=self.definitions.elkevents[event]
+            self.log.info('## Log: %s %s - %s %s %s %s' % (event_date, event_time, event_number, event_area, event_name, data))
+        except:
+            self.log.error("Log Data with Index error: %s" % data,exc_info=True)
+
 
     def zoneTextStringDescriptionReport(self, data):
 
@@ -370,9 +393,9 @@ class Client(asyncio.Protocol):
             elkzones=data[2:-4]
             for i,zone in enumerate(elkzones):
                 if (zone!='0' and i<208):
-                    if int(i+1) in self.dataset.config['motion_zones']:
+                    if int(i+1) in self.config.motion_zones:
                         mode='motion'
-                    elif int(i+1) in self.dataset.config['doorbells']:
+                    elif int(i+1) in self.config.doorbells:
                         mode='doorbell'
                     else:
                         mode='contact'
@@ -406,6 +429,15 @@ class Client(asyncio.Protocol):
         
         
 class elkm1(sofabase):
+
+    class adapter_config(configbase):
+    
+        def adapter_fields(self):
+            self.elk_address=self.set_or_default('elk_address', mandatory=True)
+            self.elk_port=self.set_or_default('elk_port', default=2101)
+            self.motion_zones=self.set_or_default('motion_zones', default=[])
+            self.doorbells=self.set_or_default('doorbells', default=[])
+            self.automation=self.set_or_default('automation', default=[])
 
     class EndpointHealth(devices.EndpointHealth):
 
@@ -488,37 +520,172 @@ class elkm1(sofabase):
                 self.log.error('!! Error during Press', exc_info=True)
                 return None
 
+    class ShadeModeController(devices.ModeController):
+
+        # THIS IS A WORK IN PROGRESS
+        #   - Support Alexa Semantics
+        #   - Cross-reference outputs into a single device
+        #   - Decide what to do with no state reporting
+        #   - Decide what to do with stop command
+        
+        
+        #device.ShadeModeController=elk.ShadeModeController('Position', device=device, 
+        #        supportedModes={'Open': 'Open', "Close": "Locked"})
+        @property
+        def proactivelyReported(self):
+            return False
+
+        @property
+        def retrievable(self):
+            return False
+
+        @property            
+        def mode(self):
+            return "Position.Stop"
+
+        @property            
+        def capabilityResources(self):
+
+            return {
+                "friendlyNames": [
+                    {
+                        "@type": "asset",
+                        "value": {
+                            "assetId": "Alexa.Setting.Opening"
+                        }
+                    }
+                ]
+            }
+
+        @property
+        def supportedModes(self):
+            sms=[]
+            for sm in self._supportedModes:
+                sms.append( {   "value": "%s.%s" % (self.name, sm), 
+                                "modeResources": { 
+                                    "friendlyNames": [
+                                        {
+                                            "@type": "asset",
+                                            "value": { 
+                                                "assetId": "Alexa.Value.%s" % self._supportedModes[sm]
+                                            }
+                                        }
+                                    ]
+                                }
+                            })
+            return sms 
+
+
+        async def SetMode(self, payload, correlationToken=''):
+            try:
+                if payload['mode'].split('.')[1] in self._supportedModes:
+                    newmode=self._supportedModes[payload['mode'].split('.')[1]]
+                    if newmode in self.nativeObject['controls']:
+                        trigger_output=self.nativeObject['controls'][newmode].split('.')[2]
+                        self.log.info('trigger output: %s' % trigger_output)
+                        await self.adapter.triggerOutput(trigger_output, '1')
+                        return self.device.Response(correlationToken)
+                else:
+                    self.log.error('!! error - did not find mode %s' % payload)
+            except:
+                self.adapter.log.error('Error setting mode status %s' % payload, exc_info=True)
+            return {}
+
+        @property
+        def actionMappings(self):
+            # These are basically hardcoded since other values aren't accepted right now
+            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-modecontroller.html
+            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-discovery.html
+            return [   
+                {
+                    "@type": "ActionsToDirective",
+                    "actions": ["Alexa.Actions.Close", "Alexa.Actions.Lower"],
+                    "directive": {
+                        "name": "SetMode",
+                        "payload": {
+                            "mode": "Position.Down"
+                        }
+                        }
+                },
+                {
+                    "@type": "ActionsToDirective",
+                    "actions": ["Alexa.Actions.Open", "Alexa.Actions.Raise"],
+                    "directive": {
+                        "name": "SetMode",
+                        "payload": {
+                            "mode": "Position.Up"
+                        }
+                    }
+                }
+            ]
+
+            
+        @property
+        def stateMappings(self):
+            # These are basically hardcoded since other values aren't accepted right now
+            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-modecontroller.html
+            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-discovery.html
+            return [
+                {
+                    "@type": "StatesToValue",
+                    "states": ["Alexa.States.Closed"],
+                    "value": "Position.Down"
+                },
+                {
+                    "@type": "StatesToValue",
+                    "states": ["Alexa.States.Open"],
+                    "value": "Position.Up"
+                }  
+            ]
+
 
     class adapterProcess(adapterbase):
     
-        def __init__(self, log=None, dataset=None, notify=None, loop=None, **kwargs):
+        def __init__(self, log=None, dataset=None, notify=None, loop=None, config=None,**kwargs):
             self.dataset=dataset
-            self.config=self.dataset.config
+            self.config=config
             self.log=log
             self.definitions=definitions.elkDefinitions
             self.notify=notify
+            self.dataset.connected=False
+            self.dataset.nativeDevices['shade']={}
+            self.dataset.nativeDevices['not_shade']={}
             if not loop:
                 self.loop = asyncio.new_event_loop()
             else:
                 self.loop=loop
             
             
-        async def start(self):
+        async def pre_activate(self):
 
             try:
-                self.elkClient = Client(loop=self.loop, log=self.log, notify=self.notify, dataset=self.dataset)
-                await self.loop.create_connection(lambda: self.elkClient, self.config["elk_address"], self.config["elk_port"])
+                self.elkClient = Client(loop=self.loop, log=self.log, notify=self.notify, dataset=self.dataset, config=self.config)
+                await self.loop.create_connection(lambda: self.elkClient, self.config.elk_address, self.config.elk_port)
+                self.log.info('.. Waiting for connect: %s' % self.dataset.connected)
+                while not self.dataset.connected:
+                    await asyncio.sleep(.2)
+                self.dataset.nativeDevices['shade']={}
+                await self.addShadeData()
 
             except:
-                self.log.error('Error', exc_info=True)
+                self.log.error('.. pre-activate error', exc_info=True)
+                
+        async def start(self):
+            pass
 
         async def addSmartDevice(self, path):
             
             try:
                 if path.split("/")[1]=="zone":
                     return self.addSmartZone(path.split("/")[2])
+                if path.split("/")[1]=="virtual":
+                    return self.addSmartZone(path.split("/")[2])
+                if path.split("/")[1]=="shade":
+                    return self.addSmartShade(path.split("/")[2])
+
                 elif path.split("/")[1] in ["task","output"]:
                     return self.addSmartButton(path.split("/")[2],path.split("/")[1])
+
             except:
                 self.log.error('Error defining smart device', exc_info=True)
 
@@ -539,7 +706,7 @@ class elkm1(sofabase):
                     elif nativeObject["zonetype"].find("Burglar")==0 or nativeObject["zonetype"].find("Non Alarm")==0:
                         if nativeObject["mode"]=="motion":
                             description='Elk Motion Sensor'
-                            if nativeObject['name'] in self.dataset.config['automation']:
+                            if nativeObject['name'] in self.config.automation:
                                 description+=' (Automation)'
                             device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['MOTION_SENSOR'], adapter=self, description=description)
                             device.MotionSensor=elkm1.MotionSensor(device=device)
@@ -552,7 +719,7 @@ class elkm1(sofabase):
                             return self.dataset.newaddDevice(device)
                         else:
                             description='Contact Sensor'
-                            if nativeObject['name'] in self.dataset.config['automation']:
+                            if nativeObject['name'] in self.config.automation:
                                 description+=' (Automation)'
                             device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['CONTACT_SENSOR'], adapter=self, description=description)
                             device.ContactSensor=elkm1.ContactSensor(device=device)
@@ -581,6 +748,42 @@ class elkm1(sofabase):
                     return self.dataset.newaddDevice(device)
             except:
                 self.log.error('Error adding Smart Button %s' % deviceid, exc_info=True)
+
+        async def addShadeData(self):
+            
+            # TODO/CHEESE - hardcoded at first but can be modularized later
+            
+            try:
+                dev_data =  {"shade": 
+                                { "1": 
+                                    { "name": "Front Shade", "status":"unknown", "type": "shade", 
+                                            "controls": {"Open": "elk.output.39", "Close": "elk.output.38", "Stop":"elk.output.40"}
+                                    }
+                                }
+                            }
+                
+                await self.dataset.ingest(dev_data)
+            except:
+                self.log.error('Error adding Blinds data', exc_info=True)
+
+        def addSmartShade(self, deviceid):
+                
+            try:
+                nativeObject=self.dataset.nativeDevices['shade'][deviceid]
+                #if 'name' not in nativeObject:
+                if 'name' not in nativeObject or 'status' not in nativeObject:
+                    self.log.info('Name info not present for %s' % deviceid)
+                    return False
+                if nativeObject['name'] not in self.dataset.localDevices:
+                    device=devices.alexaDevice('elk/%s/%s' % ('shade', deviceid), nativeObject['name'], displayCategories=['INTERIOR_BLIND'], adapter=self)
+                    device.ShadeModeController=elkm1.ShadeModeController('Position', device=device, devicetype="Blinds", 
+                            supportedModes={'Up': 'Open', "Down": "Close", "Stop": "Stop"})
+
+                    device.EndpointHealth=elkm1.EndpointHealth(device=device)
+                    return self.dataset.newaddDevice(device)
+            except:
+                self.log.error('Error adding Smart Button %s' % deviceid, exc_info=True)
+
 
 
         def virtualEventSource(self, itempath, item):
