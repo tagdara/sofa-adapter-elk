@@ -438,7 +438,8 @@ class elkm1(sofabase):
             self.motion_zones=self.set_or_default('motion_zones', default=[])
             self.doorbells=self.set_or_default('doorbells', default=[])
             self.automation=self.set_or_default('automation', default=[])
-
+            self.shades=self.set_or_default('shades', default={})
+            
     class EndpointHealth(devices.EndpointHealth):
 
         @property            
@@ -520,61 +521,8 @@ class elkm1(sofabase):
                 self.log.error('!! Error during Press', exc_info=True)
                 return None
 
-    class ShadeModeController(devices.ModeController):
 
-        # THIS IS A WORK IN PROGRESS
-        #   - Support Alexa Semantics
-        #   - Cross-reference outputs into a single device
-        #   - Decide what to do with no state reporting
-        #   - Decide what to do with stop command
-        
-        
-        #device.ShadeModeController=elk.ShadeModeController('Position', device=device, 
-        #        supportedModes={'Open': 'Open', "Close": "Locked"})
-        @property
-        def proactivelyReported(self):
-            return False
-
-        @property
-        def retrievable(self):
-            return False
-
-        @property            
-        def mode(self):
-            return "Position.Stop"
-
-        @property            
-        def capabilityResources(self):
-
-            return {
-                "friendlyNames": [
-                    {
-                        "@type": "asset",
-                        "value": {
-                            "assetId": "Alexa.Setting.Opening"
-                        }
-                    }
-                ]
-            }
-
-        @property
-        def supportedModes(self):
-            sms=[]
-            for sm in self._supportedModes:
-                sms.append( {   "value": "%s.%s" % (self.name, sm), 
-                                "modeResources": { 
-                                    "friendlyNames": [
-                                        {
-                                            "@type": "asset",
-                                            "value": { 
-                                                "assetId": "Alexa.Value.%s" % self._supportedModes[sm]
-                                            }
-                                        }
-                                    ]
-                                }
-                            })
-            return sms 
-
+    class ShadeModeController(devices.ShadeModeController):
 
         async def SetMode(self, payload, correlationToken=''):
             try:
@@ -582,7 +530,7 @@ class elkm1(sofabase):
                     newmode=self._supportedModes[payload['mode'].split('.')[1]]
                     if newmode in self.nativeObject['controls']:
                         trigger_output=self.nativeObject['controls'][newmode].split('.')[2]
-                        self.log.info('trigger output: %s' % trigger_output)
+                        self.log.info('-> trigger output: %s (%s)' % (trigger_output, newmode))
                         await self.adapter.triggerOutput(trigger_output, '1')
                         return self.device.Response(correlationToken)
                 else:
@@ -590,53 +538,6 @@ class elkm1(sofabase):
             except:
                 self.adapter.log.error('Error setting mode status %s' % payload, exc_info=True)
             return {}
-
-        @property
-        def actionMappings(self):
-            # These are basically hardcoded since other values aren't accepted right now
-            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-modecontroller.html
-            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-discovery.html
-            return [   
-                {
-                    "@type": "ActionsToDirective",
-                    "actions": ["Alexa.Actions.Close", "Alexa.Actions.Lower"],
-                    "directive": {
-                        "name": "SetMode",
-                        "payload": {
-                            "mode": "Position.Down"
-                        }
-                        }
-                },
-                {
-                    "@type": "ActionsToDirective",
-                    "actions": ["Alexa.Actions.Open", "Alexa.Actions.Raise"],
-                    "directive": {
-                        "name": "SetMode",
-                        "payload": {
-                            "mode": "Position.Up"
-                        }
-                    }
-                }
-            ]
-
-            
-        @property
-        def stateMappings(self):
-            # These are basically hardcoded since other values aren't accepted right now
-            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-modecontroller.html
-            # https://developer.amazon.com/en-US/docs/alexa/device-apis/alexa-discovery.html
-            return [
-                {
-                    "@type": "StatesToValue",
-                    "states": ["Alexa.States.Closed"],
-                    "value": "Position.Down"
-                },
-                {
-                    "@type": "StatesToValue",
-                    "states": ["Alexa.States.Open"],
-                    "value": "Position.Up"
-                }  
-            ]
 
 
     class adapterProcess(adapterbase):
@@ -676,111 +577,90 @@ class elkm1(sofabase):
         async def addSmartDevice(self, path):
             
             try:
-                if path.split("/")[1]=="zone":
-                    return self.addSmartZone(path.split("/")[2])
-                if path.split("/")[1]=="virtual":
-                    return self.addSmartZone(path.split("/")[2])
-                if path.split("/")[1]=="shade":
-                    return self.addSmartShade(path.split("/")[2])
-
-                elif path.split("/")[1] in ["task","output"]:
-                    return self.addSmartButton(path.split("/")[2],path.split("/")[1])
+                device_type=path.split("/")[1]
+                device_id=path.split("/")[2]
+                endpointId="%s:%s:%s" % ("elk",path.split("/")[1], device_id)
+                nativeObject=self.dataset.nativeDevices[device_type][device_id]
+                if 'name' not in nativeObject:
+                    #self.log.info('Name info not present for %s' % deviceid)
+                    return False
+                if endpointId not in self.dataset.localDevices:
+                    if device_type=="zone":
+                        return self.add_smart_zone(device_id, nativeObject)
+                    if device_type=="virtual":
+                        return self.add_smart_zone(device_id, nativeObject)
+                    if device_type=="shade":
+                        return self.add_smart_shade(device_id, nativeObject)
+                    elif device_type in ["task","output"]:
+                        return self.addSmartButton(device_id, device_type, nativeObject)
 
             except:
                 self.log.error('Error defining smart device', exc_info=True)
 
 
-        def addSmartZone(self, deviceid):
+        def add_smart_zone(self, deviceid, nativeObject):
             
             try:
-                nativeObject=self.dataset.nativeDevices['zone'][deviceid]
-                if 'name' not in nativeObject:
-                    #self.log.info('Name info not present for %s' % deviceid)
-                    return False
-                if nativeObject['name'] not in self.dataset.localDevices:
-                    if nativeObject["zonetype"].find("Temperature")>-1:
-                        device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['TEMPERATURE_SENSOR'], adapter=self)
-                        device.TemperatureSensor=elkm1.TemperatureSensor(device=device)
+                if nativeObject["zonetype"].find("Temperature")>-1:
+                    device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['TEMPERATURE_SENSOR'], adapter=self)
+                    device.TemperatureSensor=elkm1.TemperatureSensor(device=device)
+                    device.EndpointHealth=elkm1.EndpointHealth(device=device)
+                    return self.dataset.add_device(device)
+                elif nativeObject["zonetype"].find("Burglar")==0 or nativeObject["zonetype"].find("Non Alarm")==0:
+                    if nativeObject["mode"]=="motion":
+                        description='Elk Motion Sensor'
+                        if nativeObject['name'] in self.config.automation:
+                            description+=' (Automation)'
+                        device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['MOTION_SENSOR'], adapter=self, description=description)
+                        device.MotionSensor=elkm1.MotionSensor(device=device)
                         device.EndpointHealth=elkm1.EndpointHealth(device=device)
-                        return self.dataset.newaddDevice(device)
-                    elif nativeObject["zonetype"].find("Burglar")==0 or nativeObject["zonetype"].find("Non Alarm")==0:
-                        if nativeObject["mode"]=="motion":
-                            description='Elk Motion Sensor'
-                            if nativeObject['name'] in self.config.automation:
-                                description+=' (Automation)'
-                            device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['MOTION_SENSOR'], adapter=self, description=description)
-                            device.MotionSensor=elkm1.MotionSensor(device=device)
-                            device.EndpointHealth=elkm1.EndpointHealth(device=device)
-                            return self.dataset.newaddDevice(device)
-                        if nativeObject["mode"]=="doorbell":
-                            device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['DOORBELL'], adapter=self, )
-                            device._noAlexaInterface=True # Quirks mode shit for doorbell should probably be moved up into flexdevice def
-                            device.DoorbellEventSource=devices.DoorbellEventSource(device=device)
-                            return self.dataset.newaddDevice(device)
-                        else:
-                            description='Contact Sensor'
-                            if nativeObject['name'] in self.config.automation:
-                                description+=' (Automation)'
-                            device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['CONTACT_SENSOR'], adapter=self, description=description)
-                            device.ContactSensor=elkm1.ContactSensor(device=device)
-                            device.EndpointHealth=elkm1.EndpointHealth(device=device)
-                            return self.dataset.newaddDevice(device)
+                        return self.dataset.add_device(device)
+                    if nativeObject["mode"]=="doorbell":
+                        device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['DOORBELL'], adapter=self, )
+                        device._noAlexaInterface=True # Quirks mode shit for doorbell should probably be moved up into flexdevice def
+                        device.DoorbellEventSource=devices.DoorbellEventSource(device=device)
+                        return self.dataset.add_device(device)
                     else:
-                        self.log.info('Zonetype no match for %s' % nativeObject['zonetype'])
-                        
+                        description='Contact Sensor'
+                        if nativeObject['name'] in self.config.automation:
+                            description+=' (Automation)'
+                        device=devices.alexaDevice('elk/zone/%s' % deviceid, nativeObject['name'], displayCategories=['CONTACT_SENSOR'], adapter=self, description=description)
+                        device.ContactSensor=elkm1.ContactSensor(device=device)
+                        device.EndpointHealth=elkm1.EndpointHealth(device=device)
+                        return self.dataset.add_device(device)
+                else:
+                    self.log.info('Zonetype no match for %s' % nativeObject['zonetype'])
                 return False
-
             except:
                 self.log.error('Error adding Smart Zone  %s' % deviceid, exc_info=True)
 
-        def addSmartButton(self, deviceid, buttontype):
+        def addSmartButton(self, deviceid, buttontype, nativeObject):
             
             try:
-                nativeObject=self.dataset.nativeDevices[buttontype][deviceid]
-                #if 'name' not in nativeObject:
-                if 'name' not in nativeObject or 'status' not in nativeObject:
-                    #self.log.info('Name info not present for %s' % deviceid)
-                    return False
-                if nativeObject['name'] not in self.dataset.localDevices:
-                    device=devices.alexaDevice('elk/%s/%s' % (buttontype,deviceid), nativeObject['name'], displayCategories=['BUTTON'], adapter=self)
-                    device.ButtonController=elkm1.ButtonController(device=device)
-                    device.EndpointHealth=elkm1.EndpointHealth(device=device)
-                    return self.dataset.newaddDevice(device)
+                device=devices.alexaDevice('elk/%s/%s' % (buttontype,deviceid), nativeObject['name'], displayCategories=['BUTTON'], adapter=self)
+                device.ButtonController=elkm1.ButtonController(device=device)
+                device.EndpointHealth=elkm1.EndpointHealth(device=device)
+                return self.dataset.add_device(device)
             except:
                 self.log.error('Error adding Smart Button %s' % deviceid, exc_info=True)
 
         async def addShadeData(self):
-            
-            # TODO/CHEESE - hardcoded at first but can be modularized later
-            
+
             try:
-                dev_data =  {"shade": 
-                                { "1": 
-                                    { "name": "Front Shade", "status":"unknown", "type": "shade", 
-                                            "controls": {"Open": "elk.output.39", "Close": "elk.output.38", "Stop":"elk.output.40"}
-                                    }
-                                }
-                            }
-                
-                await self.dataset.ingest(dev_data)
+                if self.config.shades:
+                    await self.dataset.ingest({"shade" : self.config.shades})
             except:
                 self.log.error('Error adding Blinds data', exc_info=True)
 
-        def addSmartShade(self, deviceid):
+        def add_smart_shade(self, deviceid, nativeObject):
                 
             try:
-                nativeObject=self.dataset.nativeDevices['shade'][deviceid]
-                #if 'name' not in nativeObject:
-                if 'name' not in nativeObject or 'status' not in nativeObject:
-                    self.log.info('Name info not present for %s' % deviceid)
-                    return False
-                if nativeObject['name'] not in self.dataset.localDevices:
-                    device=devices.alexaDevice('elk/%s/%s' % ('shade', deviceid), nativeObject['name'], displayCategories=['INTERIOR_BLIND'], adapter=self)
-                    device.ShadeModeController=elkm1.ShadeModeController('Position', device=device, devicetype="Blinds", 
-                            supportedModes={'Up': 'Open', "Down": "Close", "Stop": "Stop"})
+                device=devices.alexaDevice('elk/%s/%s' % ('shade', deviceid), nativeObject['name'], displayCategories=['INTERIOR_BLIND'], adapter=self)
+                device.ShadeModeController=elkm1.ShadeModeController('Position', device=device, devicetype="Blinds", 
+                        supportedModes={'Up': 'Open', "Down": "Close", "Stop": "Stop"})
 
-                    device.EndpointHealth=elkm1.EndpointHealth(device=device)
-                    return self.dataset.newaddDevice(device)
+                device.EndpointHealth=elkm1.EndpointHealth(device=device)
+                return self.dataset.add_device(device)
             except:
                 self.log.error('Error adding Smart Button %s' % deviceid, exc_info=True)
 
